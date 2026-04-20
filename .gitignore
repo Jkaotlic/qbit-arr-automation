@@ -1,0 +1,16 @@
+# Runtime config with real API keys — never commit
+scripts/config.ps1
+
+# Logs
+*.log
+*.log.old
+
+# Secrets
+.qbt_pass
+*.key
+
+# Editor leftovers
+.vscode/
+.idea/
+*.swp
+Thumbs.db
