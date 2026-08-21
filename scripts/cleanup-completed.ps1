@@ -1,4 +1,4 @@
-# Cleanup job for the SSD download cache.
+﻿# Cleanup job for the SSD download cache.
 #
 # 1. Pre-flight: verify all *arr APIs respond and all configured paths exist.
 # 2. Build one in-memory index per library (hashtable key = "<ext>|<size>").
@@ -57,10 +57,16 @@ function Invoke-WithRetry {
 $VideoExt = @('.mkv', '.mp4', '.avi', '.ts', '.m2ts', '.mov', '.wmv')
 $AudioExt = @('.flac', '.mp3', '.m4a', '.opus', '.ogg', '.wav', '.alac', '.aac')
 
+# Working folders owned by other services. Never a cleanup candidate.
+$ReservedNames = @('Incomplete', 'incomplete', '.incomplete', '.partial', 'temp', '.tmp')
+
+# ExtraRoots: download folders that live OUTSIDE $Config.Paths.Completed.
+# The qBittorrent category 'music' has its own save path on G:, so downloads never
+# appear under D:\completed\music and used to pile up forever (36 GB / 134 days old).
 $Categories = @(
-    @{ Name = 'tv-sonarr'; ArrName='Sonarr'; Arr = $Config.Sonarr; Exts = $VideoExt }
-    @{ Name = 'radarr';    ArrName='Radarr'; Arr = $Config.Radarr; Exts = $VideoExt }
-    @{ Name = 'music';     ArrName='Lidarr'; Arr = $Config.Lidarr; Exts = $AudioExt }
+    @{ Name = 'tv-sonarr'; ArrName='Sonarr'; Arr = $Config.Sonarr; Exts = $VideoExt; ExtraRoots = @() }
+    @{ Name = 'radarr';    ArrName='Radarr'; Arr = $Config.Radarr; Exts = $VideoExt; ExtraRoots = @() }
+    @{ Name = 'music';     ArrName='Lidarr'; Arr = $Config.Lidarr; Exts = $AudioExt; ExtraRoots = @('G:\Music\Downloads', 'G:\Music\Soulseek\Downloads') }
 )
 
 function Test-Preflight {
@@ -76,9 +82,13 @@ function Test-Preflight {
             Write-Log "  Preflight FAIL: $($cat.ArrName) - $($_.Exception.Message)"
             $ok = $false
         }
-        if (-not (Test-Path $cat.Arr.Library)) {
-            Write-Log "  Preflight FAIL: library path missing: $($cat.Arr.Library)"
+        $libRoots = @($cat.Arr.Library)
+        $missing  = @($libRoots | Where-Object { -not (Test-Path $_) })
+        if ($missing.Count -eq $libRoots.Count) {
+            Write-Log "  Preflight FAIL: no library path exists: $($libRoots -join ', ')"
             $ok = $false
+        } elseif ($missing.Count -gt 0) {
+            Write-Log "  Preflight WARN: library root(s) missing (skipped): $($missing -join ', ')"
         }
     }
     foreach ($p in @($Config.Paths.Completed, $Config.Paths.Incompleted)) {
@@ -97,7 +107,7 @@ function Build-LibraryIndex {
     if (-not (Test-Path $libraryRoot)) { return $index }
 
     $count = 0
-    Get-ChildItem $libraryRoot -Recurse -File -ErrorAction SilentlyContinue |
+    Get-ChildItem -LiteralPath $libraryRoot -Recurse -File -ErrorAction SilentlyContinue |
         Where-Object { $allowedExts -contains $_.Extension.ToLower() } |
         ForEach-Object {
             $key = "$($_.Extension.ToLower())|$($_.Length)"
@@ -122,7 +132,9 @@ function Test-InArrQueue {
                 -Headers @{'X-Api-Key' = $arrCfg.Key} -TimeoutSec 10
         }
         foreach ($rec in $queue.records) {
-            if ($rec.title -and $itemName -like "*$($rec.title)*") { return $true }
+            # Plain substring match. -like would treat [ ] * ? in release titles as
+            # wildcards and silently mismatch (release names are full of brackets).
+            if ($rec.title -and $itemName.IndexOf($rec.title, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
         }
     } catch {
         Write-Log "  WARN: queue check failed: $($_.Exception.Message)"
@@ -133,7 +145,7 @@ function Test-InArrQueue {
 function Get-MediaFiles {
     param($item, [string[]]$allowedExts)
     if ($item.PSIsContainer) {
-        Get-ChildItem $item.FullName -Recurse -File -ErrorAction SilentlyContinue |
+        Get-ChildItem -LiteralPath $item.FullName -Recurse -File -ErrorAction SilentlyContinue |
             Where-Object { $allowedExts -contains $_.Extension.ToLower() }
     } elseif ($allowedExts -contains $item.Extension.ToLower()) {
         @($item)
@@ -145,11 +157,43 @@ function Get-MediaFiles {
 function Get-ItemSize {
     param($item)
     if ($item.PSIsContainer) {
-        (Get-ChildItem $item.FullName -Recurse -File -ErrorAction SilentlyContinue |
+        (Get-ChildItem -LiteralPath $item.FullName -Recurse -File -ErrorAction SilentlyContinue |
             Measure-Object Length -Sum).Sum
     } else {
         $item.Length
     }
+}
+
+function Get-QbitTrackedItems {
+    try {
+        $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+        $pw = Get-Content -LiteralPath $Config.Qbit.PassFile -Raw -ErrorAction Stop
+        $login = Invoke-WebRequest -Uri "$($Config.Qbit.Url)/api/v2/auth/login" -Method Post -Body "username=$($Config.Qbit.User)&password=$pw" -WebSession $session -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+        if ($login.Content -ne 'Ok.') { throw 'qBittorrent login failed' }
+        $tracked = @{}
+        $torrents = @(Invoke-RestMethod -Uri "$($Config.Qbit.Url)/api/v2/torrents/info?filter=all" -WebSession $session -TimeoutSec 20 -ErrorAction Stop)
+        foreach ($torrent in $torrents) {
+            if ($torrent.content_path) {
+                $key = $torrent.content_path.TrimEnd('\').ToLowerInvariant()
+                $tracked[$key] = $torrent.state
+            }
+        }
+        return $tracked
+    } catch {
+        Write-Log "  WARN: qBittorrent tracked-item check failed: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Get-QbitTrackedState {
+    param($item, [hashtable]$tracked)
+    $itemPath = $item.FullName.TrimEnd('\').ToLowerInvariant()
+    foreach ($entry in $tracked.GetEnumerator()) {
+        if ($entry.Key -eq $itemPath -or $entry.Key.StartsWith("$itemPath\")) {
+            return $entry.Value
+        }
+    }
+    return $null
 }
 
 function Remove-SafeItem {
@@ -158,8 +202,19 @@ function Remove-SafeItem {
     if ($null -eq $size) { $size = 0 }
     $prefix = if ($DryRun) { 'WOULD DELETE' } else { 'DELETE' }
     Write-Log ("  {0} ({1}, {2:N2} MB): {3}" -f $prefix, $reason, ($size / 1MB), $item.FullName)
-    if (-not $DryRun) {
-        Remove-Item $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    if ($DryRun) {
+        $stats.Value.Freed += $size
+        $stats.Value.Deleted++
+        return
+    }
+    try {
+        Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $item.FullName) {
+            throw 'path still exists after Remove-Item'
+        }
+    } catch {
+        Write-Log "  FAILED DELETE: $($item.FullName) - $($_.Exception.Message)"
+        return
     }
     $stats.Value.Freed += $size
     $stats.Value.Deleted++
@@ -175,25 +230,45 @@ if (-not (Test-Preflight)) {
 }
 
 $stats = @{ Freed = 0L; Deleted = 0 }
+$QbitTracked = Get-QbitTrackedItems
+if ($null -eq $QbitTracked) {
+    Write-Log '!!! qBittorrent tracked-item check failed; aborting cleanup to avoid deleting active content'
+    exit 1
+}
 
 # Build library indexes once per run.
 $Indexes = @{}
 foreach ($cat in $Categories) {
-    $Indexes[$cat.Name] = Build-LibraryIndex -libraryRoot $cat.Arr.Library -allowedExts $cat.Exts
+    $merged = @{}
+    foreach ($root in @($cat.Arr.Library)) {
+        $idx = Build-LibraryIndex -libraryRoot $root -allowedExts $cat.Exts
+        foreach ($k in $idx.Keys) { $merged[$k] = $idx[$k] }
+    }
+    $Indexes[$cat.Name] = $merged
 }
 
 # --- 1. D:\completed — per-category ---
 foreach ($cat in $Categories) {
-    $folder = Join-Path $Config.Paths.Completed $cat.Name
-    if (-not (Test-Path $folder)) { continue }
+  $roots = @((Join-Path $Config.Paths.Completed $cat.Name)) + @($cat.ExtraRoots)
+  foreach ($folder in $roots) {
+    if (-not (Test-Path -LiteralPath $folder)) { continue }
 
-    $items = Get-ChildItem $folder -ErrorAction SilentlyContinue
+    $items = @(Get-ChildItem -LiteralPath $folder -ErrorAction SilentlyContinue)
     if ($items.Count -eq 0) { continue }
 
     Write-Log "Checking $folder ($($items.Count) items)"
     $libraryIndex = $Indexes[$cat.Name]
 
     foreach ($item in $items) {
+        # Service directories of neighbouring apps must never be touched:
+        # slskd keeps partial downloads in "Incomplete", qBit/Whisparr in ".incomplete".
+        # Without this guard a two-day Soulseek idle would trip the orphan rule
+        # and delete the live working folder.
+        if ($ReservedNames -contains $item.Name) {
+            Write-Log "  SKIP (reserved service folder): $($item.Name)"
+            continue
+        }
+
         $age = (Get-Date) - $item.LastWriteTime
 
         if ($age.TotalHours -lt $Config.MinAgeHours) {
@@ -206,6 +281,12 @@ foreach ($cat in $Categories) {
             continue
         }
 
+        $qbitState = Get-QbitTrackedState $item $QbitTracked
+        if ($qbitState) {
+            Write-Log "  SKIP (tracked by qBittorrent: $qbitState): $($item.Name)"
+            continue
+        }
+
         $mediaFiles = Get-MediaFiles $item $cat.Exts
         $imported = $false
         foreach ($mf in $mediaFiles) {
@@ -213,24 +294,30 @@ foreach ($cat in $Categories) {
         }
 
         if ($imported) {
-            Remove-SafeItem $item "imported to $($cat.Arr.Library)" ([ref]$stats)
+            Remove-SafeItem $item "imported to $(@($cat.Arr.Library) -join ', ')" ([ref]$stats)
         } elseif ($age.TotalHours -gt $Config.OrphanCompletedHours) {
             Remove-SafeItem $item "orphan, $([math]::Round($age.TotalHours,0))h" ([ref]$stats)
         } else {
             Write-Log "  KEEP (not yet imported, $([math]::Round($age.TotalHours,1))h): $($item.Name)"
         }
     }
+  }
 }
 
 # --- 2. D:\incompleted — stale half-downloads ---
-if (Test-Path $Config.Paths.Incompleted) {
+if (Test-Path -LiteralPath $Config.Paths.Incompleted) {
     foreach ($cat in $Categories) {
         $folder = Join-Path $Config.Paths.Incompleted $cat.Name
-        if (-not (Test-Path $folder)) { continue }
+        if (-not (Test-Path -LiteralPath $folder)) { continue }
 
-        foreach ($item in (Get-ChildItem $folder -ErrorAction SilentlyContinue)) {
+        foreach ($item in (Get-ChildItem -LiteralPath $folder -ErrorAction SilentlyContinue)) {
             $ageDays = ((Get-Date) - $item.LastWriteTime).TotalDays
             if ($ageDays -gt $Config.OrphanIncompletedDays) {
+                $qbitState = Get-QbitTrackedState $item $QbitTracked
+                if ($qbitState) {
+                    Write-Log "  SKIP (tracked by qBittorrent: $qbitState): $($item.Name)"
+                    continue
+                }
                 Remove-SafeItem $item "stale incompleted, $([math]::Round($ageDays,1))d" ([ref]$stats)
             }
         }
