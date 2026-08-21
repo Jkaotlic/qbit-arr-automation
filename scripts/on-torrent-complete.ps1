@@ -3,6 +3,9 @@
 # 2. Polls command status until terminal state (up to 5 minutes).
 # 3. Removes the torrent entry from qBittorrent — files stay on disk,
 #    cleanup-completed.ps1 handles SSD cleanup later.
+# NOTE: qBittorrent's autorun command passes %F (content path), not %D (category
+# save path) — %D pointed at the shared category folder, not this torrent's own
+# folder/file, which broke import matching for multi-file torrents (season packs).
 
 param(
     [Parameter(Mandatory=$true)][string]$Name,
@@ -106,8 +109,8 @@ function Invoke-ArrScan {
         }
 
         if ($null -eq $cmd) {
-            Write-Log "$ArrName import status: unreachable - continuing (cleanup will sweep later)"
-            return $true
+            Write-Log "$ArrName import status: unreachable - not removing torrent (native completed-download handling will retry)"
+            return $false
         }
 
         $elapsed = if ($cmd.ended -and $cmd.queued) {
@@ -115,7 +118,7 @@ function Invoke-ArrScan {
         } else { -1 }
         Write-Log "$ArrName import status=$($cmd.status) result=$($cmd.result) elapsed=${elapsed}s"
 
-        return $true
+        return ($cmd.status -eq 'completed' -and $cmd.result -eq 'successful')
     } catch {
         Write-Log "ERROR triggering ${ArrName}: $_"
         return $false
@@ -136,6 +139,8 @@ $importOk = switch ($Category) {
 if ($importOk -and $Hash) {
     Start-Sleep -Seconds 5
     Remove-TorrentFromQbt $Hash
+} elseif ($Hash) {
+    Write-Log "Import not confirmed successful - leaving torrent in qBittorrent for native completed-download handling / retry"
 }
 
 Write-Log '=== Done ==='
